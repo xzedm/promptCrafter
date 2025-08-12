@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="PromptCrafter API", version="1.0.0")
 
 # CORS for local dev
 app.add_middleware(
@@ -30,33 +30,103 @@ class GenerateReq(BaseModel):
 @app.post("/api/generate")
 async def generate(req: GenerateReq):
     if not AZURE_ENDPOINT or not AZURE_KEY or not DEPLOYMENT:
-        raise HTTPException(500, "Azure config missing")
+        raise HTTPException(500, "Azure OpenAI configuration missing")
 
-    prompt_prefix = {
-        "image": "You are a prompt engineer for image generation models. Craft a clear descriptive prompt.",
-        "code": "You are a skilled software engineer. Craft a precise coding task prompt.",
-        "write": "You are a creative assistant. Craft a unique writing prompt."
-    }.get(req.type, "You are a helpful prompt engineer.")
+    if not req.context or not req.context.strip():
+        raise HTTPException(400, "Context is required")
 
-    system_prompt = f"{prompt_prefix}\nContext: {req.context or ''}\nProduce:"
+    # Enhanced prompt templates for each type
+    prompt_templates = {
+        "image": {
+            "system": "You are an expert prompt engineer specializing in AI image generation. Create detailed, descriptive prompts that will produce high-quality visual content. Focus on visual details, style, composition, lighting, and artistic elements.",
+            "instruction": "Transform this request into a detailed image generation prompt optimized for AI tools like DALL-E, Midjourney, or Stable Diffusion. Include specific visual elements, style references, lighting conditions, and composition details."
+        },
+        "video": {
+            "system": "You are an expert prompt engineer for AI video generation tools. Create prompts that specify motion, transitions, visual style, and temporal elements for video content creation.",
+            "instruction": "Convert this request into a comprehensive video generation prompt. Include details about motion, camera movements, visual style, transitions, duration, and any specific video elements needed."
+        },
+        "code": {
+            "system": "You are a senior software engineer and prompt engineer. Create precise, technical prompts for AI coding assistants that specify requirements, constraints, technologies, and expected outcomes.",
+            "instruction": "Transform this into a clear, technical prompt for AI coding tools. Include specific requirements, programming languages, frameworks, constraints, and expected functionality."
+        },
+        "write": {
+            "system": "You are a professional writing coach and prompt engineer. Create prompts that guide AI to produce well-structured, engaging content with clear tone, style, and purpose.",
+            "instruction": "Convert this into a detailed writing prompt. Specify the content type, tone, target audience, structure, key points to cover, and any stylistic requirements."
+        },
+        "marketing": {
+            "system": "You are a marketing expert and prompt engineer specializing in advertising and promotional content. Create prompts that generate persuasive, targeted marketing materials.",
+            "instruction": "Transform this into a marketing-focused prompt. Include target audience, brand voice, key messaging, call-to-action, platform specifications, and marketing objectives."
+        },
+        "productivity": {
+            "system": "You are a productivity consultant and prompt engineer. Create prompts that help AI assistants provide organized, actionable solutions for daily tasks and workflow optimization.",
+            "instruction": "Convert this into a productivity-focused prompt. Include task organization, time management aspects, priority levels, deadlines, and actionable steps needed."
+        }
+    }
+
+    template = prompt_templates.get(req.type, prompt_templates["write"])
+    
+    system_prompt = template["system"]
+    user_prompt = f"{template['instruction']}\n\nOriginal request: {req.context}\n\nOptimized prompt:"
 
     body = {
         "messages": [
-            {"role": "system", "content": prompt_prefix},
-            {"role": "user", "content": req.context or ""}
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
         ],
-        "max_tokens": 200,
-        "temperature": 0.7
+        "max_tokens": 300,
+        "temperature": 0.7,
+        "top_p": 0.9
     }
 
     url = f"{AZURE_ENDPOINT}/openai/deployments/{DEPLOYMENT}/chat/completions?api-version={API_VERSION}"
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, json=body, headers={"api-key": AZURE_KEY}, timeout=30)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url, 
+                json=body, 
+                headers={
+                    "api-key": AZURE_KEY,
+                    "Content-Type": "application/json"
+                }, 
+                timeout=30
+            )
 
-    if r.status_code != 200:
-        raise HTTPException(500, detail=r.text)
+        if response.status_code != 200:
+            error_detail = f"Azure OpenAI API error: {response.status_code} - {response.text}"
+            raise HTTPException(500, error_detail)
 
-    data = r.json()
-    text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    return {"prompt": text}
+        data = response.json()
+        
+        # Extract the generated prompt
+        if "choices" not in data or len(data["choices"]) == 0:
+            raise HTTPException(500, "No response from Azure OpenAI")
+        
+        generated_prompt = data["choices"][0].get("message", {}).get("content", "").strip()
+        
+        if not generated_prompt:
+            raise HTTPException(500, "Empty response from Azure OpenAI")
+
+        return {"prompt": generated_prompt}
+
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Request to Azure OpenAI timed out")
+    except httpx.RequestError as e:
+        raise HTTPException(500, f"Network error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Unexpected error: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "PromptCrafter API"}
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to PromptCrafter API", 
+        "version": "1.0.0",
+        "endpoints": {
+            "generate": "/api/generate",
+            "health": "/health"
+        }
+    }
